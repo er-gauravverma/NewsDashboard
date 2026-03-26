@@ -34,6 +34,9 @@ desktop.ini
 gvcrypto/
 gvmt5/
 trading-dashboard/
+fetch_btcusdt_price.py
+send_alert.py
+.claude/
 
 # Excel data files
 *.xlsx
