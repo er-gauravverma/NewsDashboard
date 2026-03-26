@@ -7,7 +7,7 @@ Usage:
     Then open http://localhost:5050 in your browser.
 
 Requirements:
-    pip install flask requests beautifulsoup4 duckduckgo_search yfinance vaderSentiment
+    pip install flask requests beautifulsoup4 duckduckgo_search yfinance finvader
 """
 
 import re
@@ -20,15 +20,21 @@ import yfinance as yf
 from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 from flask import Flask, jsonify, request, render_template_string
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from finvader import finvader
 
 app = Flask(__name__)
-sentiment_analyzer = SentimentIntensityAnalyzer()
 
 MARKET_SYMBOLS = {
-    "NASDAQ": {"ticker": "^IXIC", "name": "NASDAQ Composite"},
+    "NASDAQ": {"ticker": "^IXIC", "name": "NASDAQ"},
+    "S&P500": {"ticker": "^GSPC", "name": "S&P 500"},
+    "BTCUSD": {"ticker": "BTC-USD", "name": "Bitcoin"},
     "ETH": {"ticker": "ETH-USD", "name": "Ethereum"},
+    "GOLD": {"ticker": "GC=F", "name": "Gold"},
+    "CRUDE": {"ticker": "CL=F", "name": "Crude Oil"},
+    "NATGAS": {"ticker": "NG=F", "name": "Natural Gas"},
     "GBPJPY": {"ticker": "GBPJPY=X", "name": "GBP/JPY"},
+    "SILVER": {"ticker": "SI=F", "name": "Silver"},
+    "EURUSD": {"ticker": "EURUSD=X", "name": "EUR/USD"},
 }
 
 HEADERS = {
@@ -137,35 +143,80 @@ def api_search():
 
 # ── Market Data endpoint ──────────────────────────────────────────────────────
 
+def calc_rsi(closes, period=14):
+    """Calculate RSI from a list/series of closing prices."""
+    import pandas as pd
+    deltas = pd.Series(closes).diff()
+    gain = deltas.where(deltas > 0, 0.0)
+    loss = (-deltas).where(deltas < 0, 0.0)
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
 @app.route("/api/market")
 def api_market():
-    """Fetch latest prices and 24hr change for tracked symbols."""
+    """Fetch latest prices, 24hr change, 150 SMA (1H), and RSI (1H) for tracked symbols."""
     results = {}
     for key, info in MARKET_SYMBOLS.items():
         try:
             tk = yf.Ticker(info["ticker"])
-            hist = tk.history(period="5d")
-            if len(hist) >= 2:
-                current = float(hist["Close"].iloc[-1])
-                prev = float(hist["Close"].iloc[-2])
-                change = current - prev
-                change_pct = (change / prev) * 100
-                results[key] = {
-                    "name": info["name"],
-                    "ticker": info["ticker"],
-                    "price": round(current, 2),
-                    "change": round(change, 2),
-                    "change_pct": round(change_pct, 2),
-                }
-            elif len(hist) == 1:
-                current = float(hist["Close"].iloc[-1])
-                results[key] = {
-                    "name": info["name"],
-                    "ticker": info["ticker"],
-                    "price": round(current, 2),
-                    "change": 0,
-                    "change_pct": 0,
-                }
+
+            # Daily data for price + 24hr change
+            hist_daily = tk.history(period="5d")
+            current = None
+            prev = None
+            if len(hist_daily) >= 2:
+                current = float(hist_daily["Close"].iloc[-1])
+                prev = float(hist_daily["Close"].iloc[-2])
+            elif len(hist_daily) == 1:
+                current = float(hist_daily["Close"].iloc[-1])
+
+            change = (current - prev) if (current and prev) else 0
+            change_pct = (change / prev * 100) if prev else 0
+
+            # 1H candles for SMA 150 and RSI 14
+            # Need at least 150 candles of 1h data → ~19 trading days, fetch 30d to be safe
+            hist_1h = tk.history(period="30d", interval="1h")
+            sma_150 = None
+            rsi_val = None
+            sma_signal = "neutral"  # "bullish", "bearish", "neutral"
+
+            if len(hist_1h) >= 150:
+                closes_1h = hist_1h["Close"].astype(float)
+                sma_150 = float(closes_1h.rolling(window=150).mean().iloc[-1])
+                current_1h = float(closes_1h.iloc[-1])
+
+                # SMA signal: bullish/bearish/neutral
+                pct_from_sma = ((current_1h - sma_150) / sma_150) * 100
+                if pct_from_sma > 0.3:
+                    sma_signal = "bullish"
+                elif pct_from_sma < -0.3:
+                    sma_signal = "bearish"
+                else:
+                    sma_signal = "neutral"
+
+                # Use 1h close as current price (more up to date)
+                current = current_1h
+
+            if len(hist_1h) >= 15:
+                rsi_series = calc_rsi(hist_1h["Close"].astype(float).tolist())
+                last_rsi = rsi_series.iloc[-1]
+                if not (last_rsi != last_rsi):  # check for NaN
+                    rsi_val = round(float(last_rsi), 1)
+
+            results[key] = {
+                "name": info["name"],
+                "ticker": info["ticker"],
+                "price": round(current, 2) if current else None,
+                "change": round(change, 2),
+                "change_pct": round(change_pct, 2),
+                "sma_150": round(sma_150, 2) if sma_150 else None,
+                "sma_signal": sma_signal,
+                "rsi": rsi_val,
+            }
         except Exception as e:
             print(f"Market data error for {key}: {e}")
             results[key] = {
@@ -174,6 +225,9 @@ def api_market():
                 "price": None,
                 "change": 0,
                 "change_pct": 0,
+                "sma_150": None,
+                "sma_signal": "neutral",
+                "rsi": None,
             }
     return jsonify(results)
 
@@ -182,63 +236,105 @@ def api_market():
 
 @app.route("/api/sentiment")
 def api_sentiment():
-    """Analyze sentiment from recent news (last 48 hrs) for each tracked asset."""
-    results = {}
-    search_terms = {
-        "NASDAQ": "NASDAQ stock market",
-        "ETH": "Ethereum crypto",
-        "GBPJPY": "GBP JPY forex",
-    }
+    """Analyze sentiment from recent news for a given keyword."""
+    keyword = request.args.get("keyword", "").strip()
+    if not keyword:
+        return jsonify({"error": "keyword is required"}), 400
 
-    for key, query in search_terms.items():
-        articles = []
-        try:
-            with DDGS() as ddgs:
-                for item in ddgs.news(query, max_results=15):
-                    articles.append({
-                        "title": item.get("title", ""),
-                        "body": item.get("body", ""),
-                        "date": item.get("date", ""),
-                    })
-        except Exception as e:
-            print(f"Sentiment search error for {key}: {e}")
+    cutoff = datetime.utcnow() - timedelta(days=3)
+    articles = []
+    try:
+        with DDGS() as ddgs:
+            for item in ddgs.news(keyword, max_results=50):
+                # Filter: only keep articles from the last 3 days
+                date_str = item.get("date", "")
+                if date_str:
+                    try:
+                        art_date = datetime.fromisoformat(date_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                        if art_date < cutoff:
+                            continue
+                    except Exception:
+                        pass  # keep article if date can't be parsed
+                articles.append({
+                    "title": item.get("title", ""),
+                    "body": item.get("body", ""),
+                    "date": date_str,
+                    "url": item.get("url", ""),
+                })
+    except Exception as e:
+        print(f"Sentiment search error for {keyword}: {e}")
 
-        if not articles:
-            results[key] = {
-                "sentiment": "neutral",
-                "score": 0,
-                "article_count": 0,
-                "summary": "No recent news found",
-            }
+    if not articles:
+        return jsonify({
+            "keyword": keyword,
+            "sentiment": "neutral",
+            "score": 0,
+            "article_count": 0,
+            "summary": "No recent news found",
+        })
+
+    # Analyze sentiment of all collected headlines + bodies
+    compound_scores = []
+    pos_scores = []
+    neg_scores = []
+    neu_scores = []
+    article_sentiments = []  # (compound, title, url) tuples
+
+    for art in articles:
+        text = f"{art['title']}. {art['body']}"
+        if not text.strip() or text.strip() == ".":
             continue
+        try:
+            comp = finvader(text, use_sentibignomics=True, use_henry=True, indicator='compound')
+            pos = finvader(text, use_sentibignomics=True, use_henry=True, indicator='pos')
+            neg = finvader(text, use_sentibignomics=True, use_henry=True, indicator='neg')
+            neu = finvader(text, use_sentibignomics=True, use_henry=True, indicator='neu')
+        except Exception:
+            continue
+        compound_scores.append(comp)
+        pos_scores.append(pos)
+        neg_scores.append(neg)
+        neu_scores.append(neu)
+        article_sentiments.append((comp, art["title"], art["url"]))
 
-        # Analyze sentiment of all collected headlines + bodies
-        scores = []
-        for art in articles:
-            text = f"{art['title']}. {art['body']}"
-            vs = sentiment_analyzer.polarity_scores(text)
-            scores.append(vs["compound"])
+    n = len(compound_scores)
+    avg_score = sum(compound_scores) / n if n else 0
+    avg_pos = sum(pos_scores) / n if n else 0
+    avg_neg = sum(neg_scores) / n if n else 0
+    avg_neu = sum(neu_scores) / n if n else 0
 
-        avg_score = sum(scores) / len(scores) if scores else 0
+    if avg_score >= 0.15:
+        sentiment = "bullish"
+    elif avg_score <= -0.15:
+        sentiment = "bearish"
+    else:
+        sentiment = "neutral"
 
-        if avg_score >= 0.15:
-            sentiment = "bullish"
-        elif avg_score <= -0.15:
-            sentiment = "bearish"
-        else:
-            sentiment = "neutral"
+    # Most positive and most negative articles
+    sorted_arts = sorted(article_sentiments, key=lambda x: x[0])
+    most_negative = sorted_arts[0] if sorted_arts else (0, "", "")
+    most_positive = sorted_arts[-1] if sorted_arts else (0, "", "")
 
-        # Pick top headline as summary
-        summary = articles[0]["title"] if articles else ""
+    # Distribution: count bullish / bearish / neutral articles
+    bullish_count = sum(1 for s in compound_scores if s >= 0.15)
+    bearish_count = sum(1 for s in compound_scores if s <= -0.15)
+    neutral_count = n - bullish_count - bearish_count
 
-        results[key] = {
-            "sentiment": sentiment,
-            "score": round(avg_score, 3),
-            "article_count": len(articles),
-            "summary": summary,
-        }
+    summary = articles[0]["title"] if articles else ""
 
-    return jsonify(results)
+    return jsonify({
+        "keyword": keyword,
+        "sentiment": sentiment,
+        "score": round(avg_score, 3),
+        "avg_pos": round(avg_pos, 3),
+        "avg_neg": round(avg_neg, 3),
+        "avg_neu": round(avg_neu, 3),
+        "article_count": n,
+        "most_positive": {"title": most_positive[1], "score": round(most_positive[0], 3), "url": most_positive[2]},
+        "most_negative": {"title": most_negative[1], "score": round(most_negative[0], 3), "url": most_negative[2]},
+        "distribution": {"bullish": bullish_count, "bearish": bearish_count, "neutral": neutral_count},
+        "summary": summary,
+    })
 
 
 # ── Dashboard HTML ────────────────────────────────────────────────────────────
@@ -409,31 +505,6 @@ DASHBOARD_HTML = r"""
 
   .btn-thumbs.active {
     background: linear-gradient(135deg, var(--green) 0%, #3aaa55 100%);
-  }
-
-  /* ── Quick tags ── */
-  .quick-tags {
-    display: flex;
-    gap: 8px;
-    margin-top: 12px;
-    flex-wrap: wrap;
-  }
-
-  .tag {
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 20px;
-    padding: 6px 14px;
-    font-size: 12px;
-    color: var(--text2);
-    cursor: pointer;
-    transition: all 0.2s;
-  }
-
-  .tag:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: rgba(108, 140, 255, 0.08);
   }
 
   /* ── Status ── */
@@ -803,99 +874,353 @@ DASHBOARD_HTML = r"""
   }
 
   .market-grid {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 16px;
+    display: flex;
+    gap: 10px;
+    overflow-x: auto;
+    padding-bottom: 8px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
   }
+
+  .market-grid::-webkit-scrollbar { height: 4px; }
+  .market-grid::-webkit-scrollbar-track { background: transparent; }
+  .market-grid::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
   .market-card {
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 20px;
+    border-radius: 10px;
+    padding: 12px 16px;
+    min-width: 155px;
+    flex-shrink: 0;
+    cursor: pointer;
     transition: transform 0.2s, border-color 0.2s;
   }
 
   .market-card:hover {
     transform: translateY(-2px);
-    border-color: var(--accent);
   }
 
-  .market-card-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 12px;
+  .market-card.sma-bullish {
+    background: linear-gradient(135deg, rgba(81, 207, 102, 0.18) 0%, rgba(81, 207, 102, 0.08) 100%);
+    border-color: var(--green);
+    border-width: 2px;
+    box-shadow: 0 0 12px rgba(81, 207, 102, 0.15), inset 0 0 20px rgba(81, 207, 102, 0.05);
   }
+
+  .market-card.sma-bearish {
+    background: linear-gradient(135deg, rgba(255, 107, 107, 0.18) 0%, rgba(255, 107, 107, 0.08) 100%);
+    border-color: var(--red);
+    border-width: 2px;
+    box-shadow: 0 0 12px rgba(255, 107, 107, 0.15), inset 0 0 20px rgba(255, 107, 107, 0.05);
+  }
+
+  .market-card.sma-neutral {
+    background: linear-gradient(135deg, rgba(255, 169, 77, 0.18) 0%, rgba(255, 169, 77, 0.08) 100%);
+    border-color: var(--orange);
+    border-width: 2px;
+    box-shadow: 0 0 12px rgba(255, 169, 77, 0.15), inset 0 0 20px rgba(255, 169, 77, 0.05);
+  }
+
+  .market-card.sma-bullish:hover { box-shadow: 0 4px 20px rgba(81, 207, 102, 0.3); }
+  .market-card.sma-bearish:hover { box-shadow: 0 4px 20px rgba(255, 107, 107, 0.3); }
+  .market-card.sma-neutral:hover { box-shadow: 0 4px 20px rgba(255, 169, 77, 0.3); }
 
   .market-card-name {
-    font-size: 13px;
+    font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
     color: var(--text2);
-  }
-
-  .market-card-badge {
-    font-size: 10px;
-    padding: 3px 8px;
-    border-radius: 6px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-
-  .market-card-badge.bullish {
-    background: rgba(81, 207, 102, 0.15);
-    color: var(--green);
-  }
-
-  .market-card-badge.bearish {
-    background: rgba(255, 107, 107, 0.15);
-    color: var(--red);
-  }
-
-  .market-card-badge.neutral {
-    background: rgba(255, 169, 77, 0.15);
-    color: var(--orange);
+    margin-bottom: 6px;
+    white-space: nowrap;
   }
 
   .market-card-price {
-    font-size: 28px;
+    font-size: 18px;
     font-weight: 700;
-    margin-bottom: 6px;
+    white-space: nowrap;
   }
 
   .market-card-change {
     display: flex;
     align-items: center;
-    gap: 8px;
-    font-size: 14px;
+    gap: 4px;
+    font-size: 11px;
     font-weight: 600;
-    margin-bottom: 16px;
+    margin-top: 4px;
   }
 
   .market-card-change.up { color: var(--green); }
   .market-card-change.down { color: var(--red); }
   .market-card-change.flat { color: var(--text2); }
 
-  .sentiment-bar-wrap {
-    margin-top: 12px;
-    padding-top: 12px;
+  .market-card-indicators {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .market-card-ind-row {
+    font-size: 10px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: var(--text2);
+    margin-bottom: 3px;
+  }
+
+  .market-card-ind-row:last-child { margin-bottom: 0; }
+
+  .rsi-value {
+    font-weight: 700;
+  }
+
+  .rsi-value.overbought { color: var(--red); }
+  .rsi-value.oversold { color: var(--green); }
+  .rsi-value.normal { color: var(--text); }
+
+  .sma-value {
+    font-weight: 700;
+    color: var(--text);
+  }
+
+  .market-loading {
+    text-align: center;
+    padding: 20px;
+    color: var(--text2);
+    font-size: 14px;
+  }
+
+  .market-loading .spinner {
+    margin: 0 auto 12px;
+  }
+
+  /* ── Sentiment Panel (above news) ── */
+  .sentiment-panel {
+    max-width: 1400px;
+    margin: 16px auto 0;
+    padding: 0 24px;
+  }
+
+  .sentiment-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 20px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .sentiment-top-row {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+
+  .sentiment-details {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 16px;
+    padding-top: 16px;
     border-top: 1px solid var(--border);
   }
 
-  .sentiment-label {
+  .sentiment-detail-box {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+  }
+
+  .sentiment-detail-box h4 {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text2);
+    margin-bottom: 10px;
+  }
+
+  /* Stacked bar for pos/neg/neu breakdown */
+  .stacked-bar {
+    display: flex;
+    height: 10px;
+    border-radius: 5px;
+    overflow: hidden;
+    margin-bottom: 8px;
+  }
+
+  .stacked-bar .bar-pos { background: var(--green); }
+  .stacked-bar .bar-neg { background: var(--red); }
+  .stacked-bar .bar-neu { background: var(--orange); }
+
+  .stacked-legend {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .stacked-legend span {
+    font-size: 11px;
+    color: var(--text2);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .legend-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+
+  .legend-dot.pos { background: var(--green); }
+  .legend-dot.neg { background: var(--red); }
+  .legend-dot.neu { background: var(--orange); }
+
+  /* Extreme articles */
+  .extreme-article {
+    margin-bottom: 10px;
+  }
+
+  .extreme-article:last-child { margin-bottom: 0; }
+
+  .extreme-label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+  }
+
+  .extreme-label.pos-label { color: var(--green); }
+  .extreme-label.neg-label { color: var(--red); }
+
+  .extreme-title {
+    font-size: 12px;
+    color: var(--text);
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  a.extreme-link {
+    text-decoration: none;
+    color: var(--text);
+    transition: color 0.2s;
+  }
+
+  a.extreme-link:hover {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+
+  .extreme-score {
+    font-size: 11px;
+    font-weight: 600;
+    margin-top: 2px;
+  }
+
+  /* Distribution mini bars */
+  .dist-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+
+  .dist-row:last-child { margin-bottom: 0; }
+
+  .dist-label {
+    font-size: 11px;
+    color: var(--text2);
+    width: 52px;
+    flex-shrink: 0;
+  }
+
+  .dist-bar-wrap {
+    flex: 1;
+    height: 8px;
+    background: var(--surface2);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .dist-bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.5s ease;
+  }
+
+  .dist-count {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text2);
+    width: 20px;
+    text-align: right;
+  }
+
+  .sentiment-card-label {
+    font-size: 13px;
+    color: var(--text2);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .sentiment-card-keyword {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--text);
+  }
+
+  .sentiment-badge {
+    font-size: 14px;
+    padding: 6px 16px;
+    border-radius: 8px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .sentiment-badge.bullish {
+    background: rgba(81, 207, 102, 0.15);
+    color: var(--green);
+  }
+
+  .sentiment-badge.bearish {
+    background: rgba(255, 107, 107, 0.15);
+    color: var(--red);
+  }
+
+  .sentiment-badge.neutral {
+    background: rgba(255, 169, 77, 0.15);
+    color: var(--orange);
+  }
+
+  .sentiment-bar-wrap {
+    flex: 1;
+    min-width: 200px;
+  }
+
+  .sentiment-bar-info {
     display: flex;
     align-items: center;
     justify-content: space-between;
     font-size: 12px;
     color: var(--text2);
-    margin-bottom: 8px;
+    margin-bottom: 6px;
   }
 
   .sentiment-score {
-    font-weight: 600;
+    font-weight: 700;
   }
 
   .sentiment-score.bullish { color: var(--green); }
@@ -904,16 +1229,15 @@ DASHBOARD_HTML = r"""
 
   .sentiment-bar {
     width: 100%;
-    height: 6px;
+    height: 8px;
     background: var(--surface2);
-    border-radius: 3px;
+    border-radius: 4px;
     overflow: hidden;
-    position: relative;
   }
 
   .sentiment-bar-fill {
     height: 100%;
-    border-radius: 3px;
+    border-radius: 4px;
     transition: width 0.6s ease;
   }
 
@@ -922,7 +1246,7 @@ DASHBOARD_HTML = r"""
   .sentiment-bar-fill.neutral { background: linear-gradient(90deg, var(--orange), #ffc578); }
 
   .sentiment-summary {
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text2);
     margin-top: 8px;
     line-height: 1.4;
@@ -932,20 +1256,22 @@ DASHBOARD_HTML = r"""
     overflow: hidden;
   }
 
-  .market-loading {
+  .sentiment-loading {
     text-align: center;
-    padding: 40px;
+    padding: 12px;
     color: var(--text2);
-    font-size: 14px;
-  }
-
-  .market-loading .spinner {
-    margin: 0 auto 12px;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
   }
 
   /* ── Responsive ── */
   @media (max-width: 900px) {
-    .market-grid { grid-template-columns: 1fr; }
+    .market-grid { flex-wrap: nowrap; }
+    .sentiment-top-row { flex-direction: column; align-items: flex-start; gap: 12px; }
+    .sentiment-details { grid-template-columns: 1fr; }
   }
 
   @media (max-width: 600px) {
@@ -977,30 +1303,21 @@ DASHBOARD_HTML = r"""
       <button class="btn btn-thumbs" id="thumb-btn" type="button" onclick="toggleThumbs()" title="Fetch thumbnails (slower)">Thumbnails</button>
       <button class="btn" type="submit" id="search-btn">Search</button>
     </form>
-    <div class="quick-tags">
-      <span class="tag" onclick="quickSearch('NASDAQ')">NASDAQ</span>
-      <span class="tag" onclick="quickSearch('Ethereum')">Ethereum</span>
-      <span class="tag" onclick="quickSearch('GBP JPY Forex')">GBP/JPY</span>
-      <span class="tag" onclick="quickSearch('Crude Oil')">Crude Oil</span>
-      <span class="tag" onclick="quickSearch('Gold Price')">Gold Price</span>
-      <span class="tag" onclick="quickSearch('Bitcoin')">Bitcoin</span>
-      <span class="tag" onclick="quickSearch('Nifty 50')">Nifty 50</span>
-      <span class="tag" onclick="quickSearch('S&P 500')">S&P 500</span>
-      <span class="tag" onclick="quickSearch('Forex EUR USD')">EUR/USD</span>
-      <span class="tag" onclick="quickSearch('Natural Gas')">Natural Gas</span>
-    </div>
   </div>
 </div>
 
-<!-- ── Market Ticker + Sentiment Section ── -->
+<!-- ── Market Ticker Section ── -->
 <div class="market-section" id="market-section">
   <div class="market-loading">
     <div class="spinner"></div>
-    Loading market data &amp; sentiment...
+    Loading market data...
   </div>
 </div>
 
 <div class="status-bar" id="status-bar"></div>
+
+<!-- ── Sentiment Panel (shown after search) ── -->
+<div class="sentiment-panel" id="sentiment-panel" style="display:none;"></div>
 
 <div id="content">
   <div class="empty-state">
@@ -1188,11 +1505,6 @@ function toggleThumbs() {
   btn.classList.toggle('active', fetchThumbs);
 }
 
-function quickSearch(kw) {
-  document.getElementById('keyword-input').value = kw;
-  doSearch();
-}
-
 function doSearch(e) {
   if (e) e.preventDefault();
 
@@ -1209,6 +1521,9 @@ function doSearch(e) {
   const sourceLabel = source ? document.getElementById('source-select').selectedOptions[0].textContent : '';
   document.getElementById('status-bar').innerHTML = '<div class="spinner"></div><span class="status-text">Searching for "' + escHtml(keyword) + '"' + (source ? ' on ' + escHtml(sourceLabel) : '') + '...</span>';
   document.getElementById('content').innerHTML = '';
+
+  // Load sentiment analysis for the searched keyword
+  loadSentiment(keyword);
 
   const params = new URLSearchParams({ keyword, limit });
   if (source) params.set('source', source);
@@ -1318,67 +1633,77 @@ document.addEventListener('keydown', function(e) {
   if (e.key === 'Escape') closeSettings();
 });
 
-// ── Market Data + Sentiment ──
+// ── Market card search terms ──
+const MARKET_SEARCH_TERMS = {
+  'NASDAQ': 'NASDAQ',
+  'S&P500': 'S&P 500',
+  'BTCUSD': 'Bitcoin',
+  'ETH': 'Ethereum',
+  'GOLD': 'Gold',
+  'SILVER': 'Silver',
+  'CRUDE': 'Crude Oil',
+  'NATGAS': 'Natural Gas',
+  'GBPJPY': 'GBP JPY Forex',
+  'EURUSD': 'EUR USD Forex',
+};
+
+function marketSearch(keyword) {
+  document.getElementById('keyword-input').value = keyword;
+  doSearch();
+}
+
+// ── Market Data ──
 function loadMarketData() {
   const section = document.getElementById('market-section');
 
-  // Fetch market prices and sentiment in parallel
-  Promise.all([
-    fetch('/api/market').then(r => r.json()),
-    fetch('/api/sentiment').then(r => r.json())
-  ])
-  .then(([market, sentiment]) => {
-    renderMarketSection(market, sentiment);
+  fetch('/api/market').then(r => r.json())
+  .then(market => {
+    renderMarketSection(market);
   })
   .catch(err => {
     section.innerHTML = '<div class="market-loading" style="color:var(--red)">Failed to load market data: ' + escHtml(err.message) + '</div>';
   });
 }
 
-function renderMarketSection(market, sentiment) {
+function renderMarketSection(market) {
   const section = document.getElementById('market-section');
-  const keys = ['NASDAQ', 'ETH', 'GBPJPY'];
-  const icons = { NASDAQ: '\u{1F4C8}', ETH: '\u{26D3}', GBPJPY: '\u{1F4B1}' };
+  const keys = ['NASDAQ', 'S&P500', 'BTCUSD', 'ETH', 'GOLD', 'SILVER', 'CRUDE', 'NATGAS', 'GBPJPY', 'EURUSD'];
 
   let html = '<div class="market-grid">';
 
   keys.forEach(key => {
     const m = market[key] || {};
-    const s = sentiment[key] || {};
-
     const price = m.price != null ? formatPrice(m.price, key) : '--';
     const change = m.change || 0;
     const changePct = m.change_pct || 0;
     const changeDir = change > 0 ? 'up' : change < 0 ? 'down' : 'flat';
     const changeSign = change > 0 ? '+' : '';
-    const arrow = change > 0 ? '\u25B2' : change < 0 ? '\u25BC' : '\u25C6';
+    const arrow = change > 0 ? '\u25B2' : change < 0 ? '\u25BC' : '';
 
-    const sentimentType = s.sentiment || 'neutral';
-    const sentimentScore = s.score || 0;
-    // Convert score from [-1,1] to percentage [0,100]
-    const barPct = Math.round(((sentimentScore + 1) / 2) * 100);
-    const sentimentLabel = sentimentType.charAt(0).toUpperCase() + sentimentType.slice(1);
-    const articleCount = s.article_count || 0;
-    const summary = s.summary || '';
+    const smaSignal = m.sma_signal || 'neutral';
+    const rsi = m.rsi;
+    const rsiClass = rsi != null ? (rsi >= 70 ? 'overbought' : rsi <= 30 ? 'oversold' : 'normal') : 'normal';
+    const rsiLabel = rsi != null ? rsi.toFixed(1) : '--';
+    const sma150 = m.sma_150;
+    const smaLabel = sma150 != null ? formatPrice(sma150, key) : '--';
 
+    const searchTerm = MARKET_SEARCH_TERMS[key] || m.name || key;
     html +=
-      '<div class="market-card">' +
-        '<div class="market-card-header">' +
-          '<span class="market-card-name">' + icons[key] + ' ' + escHtml(m.name || key) + '</span>' +
-          '<span class="market-card-badge ' + sentimentType + '">' + sentimentLabel + '</span>' +
-        '</div>' +
+      '<div class="market-card sma-' + smaSignal + '" onclick="marketSearch(\'' + escAttr(searchTerm) + '\')">' +
+        '<div class="market-card-name">' + escHtml(m.name || key) + '</div>' +
         '<div class="market-card-price">' + price + '</div>' +
         '<div class="market-card-change ' + changeDir + '">' +
-          '<span>' + arrow + '</span>' +
-          '<span>' + changeSign + change.toFixed(2) + ' (' + changeSign + changePct.toFixed(2) + '%)</span>' +
+          '<span>' + arrow + ' ' + changeSign + changePct.toFixed(2) + '%</span>' +
         '</div>' +
-        '<div class="sentiment-bar-wrap">' +
-          '<div class="sentiment-label">' +
-            '<span>Sentiment (' + articleCount + ' articles)</span>' +
-            '<span class="sentiment-score ' + sentimentType + '">' + (sentimentScore >= 0 ? '+' : '') + sentimentScore.toFixed(3) + '</span>' +
+        '<div class="market-card-indicators">' +
+          '<div class="market-card-ind-row">' +
+            '<span>RSI (1H)</span>' +
+            '<span class="rsi-value ' + rsiClass + '">' + rsiLabel + '</span>' +
           '</div>' +
-          '<div class="sentiment-bar"><div class="sentiment-bar-fill ' + sentimentType + '" style="width:' + barPct + '%"></div></div>' +
-          (summary ? '<div class="sentiment-summary">' + escHtml(summary) + '</div>' : '') +
+          '<div class="market-card-ind-row">' +
+            '<span>SMA 150</span>' +
+            '<span class="sma-value">' + smaLabel + '</span>' +
+          '</div>' +
         '</div>' +
       '</div>';
   });
@@ -1388,17 +1713,145 @@ function renderMarketSection(market, sentiment) {
 }
 
 function formatPrice(price, key) {
-  if (key === 'NASDAQ') return price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  if (key === 'ETH') return '$' + price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (key === 'NASDAQ' || key === 'S&P500') return price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (key === 'ETH' || key === 'BTCUSD') return '$' + price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (key === 'GOLD' || key === 'SILVER' || key === 'CRUDE' || key === 'NATGAS') return '$' + price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   if (key === 'GBPJPY') return '\u00A5' + price.toFixed(3);
+  if (key === 'EURUSD') return '$' + price.toFixed(5);
   return price.toFixed(2);
+}
+
+// ── Sentiment for searched keyword ──
+function loadSentiment(keyword) {
+  const panel = document.getElementById('sentiment-panel');
+  panel.style.display = 'block';
+  panel.innerHTML = '<div class="sentiment-loading"><div class="spinner"></div> Analyzing sentiment for "' + escHtml(keyword) + '"...</div>';
+
+  fetch('/api/sentiment?keyword=' + encodeURIComponent(keyword))
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) {
+        panel.style.display = 'none';
+        return;
+      }
+      renderSentimentPanel(data);
+    })
+    .catch(() => {
+      panel.style.display = 'none';
+    });
+}
+
+function renderSentimentPanel(data) {
+  const panel = document.getElementById('sentiment-panel');
+  const sType = data.sentiment || 'neutral';
+  const score = data.score || 0;
+  const barPct = Math.round(((score + 1) / 2) * 100);
+  const label = sType.charAt(0).toUpperCase() + sType.slice(1);
+  const artCount = data.article_count || 0;
+
+  // Breakdown percentages
+  const avgPos = data.avg_pos || 0;
+  const avgNeg = data.avg_neg || 0;
+  const avgNeu = data.avg_neu || 0;
+  const posPct = Math.round(avgPos * 100);
+  const negPct = Math.round(avgNeg * 100);
+  const neuPct = 100 - posPct - negPct;
+
+  // Extremes
+  const mostPos = data.most_positive || {};
+  const mostNeg = data.most_negative || {};
+
+  // Distribution
+  const dist = data.distribution || {};
+  const bullCount = dist.bullish || 0;
+  const bearCount = dist.bearish || 0;
+  const neutCount = dist.neutral || 0;
+  const maxDist = Math.max(bullCount, bearCount, neutCount, 1);
+
+  panel.innerHTML =
+    '<div class="sentiment-card">' +
+      // ── Top row: keyword + badge + compound bar ──
+      '<div class="sentiment-top-row">' +
+        '<div>' +
+          '<div class="sentiment-card-label">Sentiment Analysis</div>' +
+          '<div class="sentiment-card-keyword">' + escHtml(data.keyword || '') + '</div>' +
+        '</div>' +
+        '<span class="sentiment-badge ' + sType + '">' + label + '</span>' +
+        '<div class="sentiment-bar-wrap">' +
+          '<div class="sentiment-bar-info">' +
+            '<span>' + artCount + ' articles analyzed</span>' +
+            '<span class="sentiment-score ' + sType + '">' + (score >= 0 ? '+' : '') + score.toFixed(3) + '</span>' +
+          '</div>' +
+          '<div class="sentiment-bar"><div class="sentiment-bar-fill ' + sType + '" style="width:' + barPct + '%"></div></div>' +
+        '</div>' +
+      '</div>' +
+
+      // ── Details row: 3 boxes ──
+      '<div class="sentiment-details">' +
+
+        // Box 1: Pos/Neg/Neu breakdown
+        '<div class="sentiment-detail-box">' +
+          '<h4>Text Tone Breakdown</h4>' +
+          '<div class="stacked-bar">' +
+            '<div class="bar-pos" style="width:' + posPct + '%"></div>' +
+            '<div class="bar-neg" style="width:' + negPct + '%"></div>' +
+            '<div class="bar-neu" style="width:' + neuPct + '%"></div>' +
+          '</div>' +
+          '<div class="stacked-legend">' +
+            '<span><span class="legend-dot pos"></span> Positive ' + posPct + '%</span>' +
+            '<span><span class="legend-dot neg"></span> Negative ' + negPct + '%</span>' +
+            '<span><span class="legend-dot neu"></span> Neutral ' + neuPct + '%</span>' +
+          '</div>' +
+        '</div>' +
+
+        // Box 2: Most positive & negative articles (clickable)
+        '<div class="sentiment-detail-box">' +
+          '<h4>Extreme Articles</h4>' +
+          '<div class="extreme-article">' +
+            '<div class="extreme-label pos-label">\u25B2 Most Positive</div>' +
+            (mostPos.url
+              ? '<a class="extreme-title extreme-link" href="' + escAttr(mostPos.url) + '" target="_blank">' + escHtml(mostPos.title || '--') + '</a>'
+              : '<div class="extreme-title">' + escHtml(mostPos.title || '--') + '</div>') +
+            '<div class="extreme-score" style="color:var(--green)">' + (mostPos.score != null ? (mostPos.score >= 0 ? '+' : '') + mostPos.score.toFixed(3) : '--') + '</div>' +
+          '</div>' +
+          '<div class="extreme-article">' +
+            '<div class="extreme-label neg-label">\u25BC Most Negative</div>' +
+            (mostNeg.url
+              ? '<a class="extreme-title extreme-link" href="' + escAttr(mostNeg.url) + '" target="_blank">' + escHtml(mostNeg.title || '--') + '</a>'
+              : '<div class="extreme-title">' + escHtml(mostNeg.title || '--') + '</div>') +
+            '<div class="extreme-score" style="color:var(--red)">' + (mostNeg.score != null ? (mostNeg.score >= 0 ? '+' : '') + mostNeg.score.toFixed(3) : '--') + '</div>' +
+          '</div>' +
+        '</div>' +
+
+        // Box 3: Distribution
+        '<div class="sentiment-detail-box">' +
+          '<h4>Article Distribution</h4>' +
+          '<div class="dist-row">' +
+            '<span class="dist-label" style="color:var(--green)">Bullish</span>' +
+            '<div class="dist-bar-wrap"><div class="dist-bar-fill" style="width:' + Math.round((bullCount/maxDist)*100) + '%;background:var(--green)"></div></div>' +
+            '<span class="dist-count">' + bullCount + '</span>' +
+          '</div>' +
+          '<div class="dist-row">' +
+            '<span class="dist-label" style="color:var(--orange)">Neutral</span>' +
+            '<div class="dist-bar-wrap"><div class="dist-bar-fill" style="width:' + Math.round((neutCount/maxDist)*100) + '%;background:var(--orange)"></div></div>' +
+            '<span class="dist-count">' + neutCount + '</span>' +
+          '</div>' +
+          '<div class="dist-row">' +
+            '<span class="dist-label" style="color:var(--red)">Bearish</span>' +
+            '<div class="dist-bar-wrap"><div class="dist-bar-fill" style="width:' + Math.round((bearCount/maxDist)*100) + '%;background:var(--red)"></div></div>' +
+            '<span class="dist-count">' + bearCount + '</span>' +
+          '</div>' +
+        '</div>' +
+
+      '</div>' +
+    '</div>';
 }
 
 // ── Initialize on load ──
 window.addEventListener('DOMContentLoaded', function() {
   populateSourceDropdown();
 
-  // Load market data + sentiment
+  // Load market data
   loadMarketData();
 
   // Auto-search "Business News" on startup

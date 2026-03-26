@@ -4,4 +4,5 @@ beautifulsoup4
 duckduckgo_search
 gunicorn
 yfinance
-vaderSentiment
+pandas
+finvader
