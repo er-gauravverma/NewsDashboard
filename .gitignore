@@ -33,6 +33,7 @@ desktop.ini
 # Excluded modules
 gvcrypto/
 gvmt5/
+trading-dashboard/
 
 # Excel data files
 *.xlsx
