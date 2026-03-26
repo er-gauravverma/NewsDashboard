@@ -1059,5 +1059,7 @@ def dashboard():
 
 
 if __name__ == "__main__":
-    print("\n  News Dashboard running at http://localhost:5050\n")
-    app.run(host="0.0.0.0", port=5050, debug=True)
+    import os
+    port = int(os.environ.get("PORT", 5050))
+    print(f"\n  News Dashboard running at http://localhost:{port}\n")
+    app.run(host="0.0.0.0", port=port, debug=os.environ.get("DEBUG", "false").lower() == "true")
