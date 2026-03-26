@@ -30,8 +30,9 @@ desktop.ini
 # Logs
 *.log
 
-# Secrets & config (keep example, ignore real config)
-gvcrypto/config.json
+# Excluded modules
+gvcrypto/
+gvmt5/
 
 # Excel data files
 *.xlsx
