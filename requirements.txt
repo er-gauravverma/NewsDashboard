@@ -3,3 +3,5 @@ requests
 beautifulsoup4
 duckduckgo_search
 gunicorn
+yfinance
+vaderSentiment

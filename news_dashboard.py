@@ -1,24 +1,35 @@
 """
-News Dashboard - Web app with thumbnail cards for news articles.
+News Dashboard - Web app with thumbnail cards for news articles,
+live market prices, and sentiment analysis.
 
 Usage:
     python news_dashboard.py
     Then open http://localhost:5050 in your browser.
 
 Requirements:
-    pip install flask requests beautifulsoup4 duckduckgo_search
+    pip install flask requests beautifulsoup4 duckduckgo_search yfinance vaderSentiment
 """
 
 import re
 import traceback
+from datetime import datetime, timedelta
 from urllib.parse import urljoin
 
 import requests
+import yfinance as yf
 from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 from flask import Flask, jsonify, request, render_template_string
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 app = Flask(__name__)
+sentiment_analyzer = SentimentIntensityAnalyzer()
+
+MARKET_SYMBOLS = {
+    "NASDAQ": {"ticker": "^IXIC", "name": "NASDAQ Composite"},
+    "ETH": {"ticker": "ETH-USD", "name": "Ethereum"},
+    "GBPJPY": {"ticker": "GBPJPY=X", "name": "GBP/JPY"},
+}
 
 HEADERS = {
     "User-Agent": (
@@ -122,6 +133,112 @@ def api_search():
                     item["image"] = img
 
     return jsonify({"keyword": keyword, "source": source, "count": len(results), "results": results})
+
+
+# ── Market Data endpoint ──────────────────────────────────────────────────────
+
+@app.route("/api/market")
+def api_market():
+    """Fetch latest prices and 24hr change for tracked symbols."""
+    results = {}
+    for key, info in MARKET_SYMBOLS.items():
+        try:
+            tk = yf.Ticker(info["ticker"])
+            hist = tk.history(period="5d")
+            if len(hist) >= 2:
+                current = float(hist["Close"].iloc[-1])
+                prev = float(hist["Close"].iloc[-2])
+                change = current - prev
+                change_pct = (change / prev) * 100
+                results[key] = {
+                    "name": info["name"],
+                    "ticker": info["ticker"],
+                    "price": round(current, 2),
+                    "change": round(change, 2),
+                    "change_pct": round(change_pct, 2),
+                }
+            elif len(hist) == 1:
+                current = float(hist["Close"].iloc[-1])
+                results[key] = {
+                    "name": info["name"],
+                    "ticker": info["ticker"],
+                    "price": round(current, 2),
+                    "change": 0,
+                    "change_pct": 0,
+                }
+        except Exception as e:
+            print(f"Market data error for {key}: {e}")
+            results[key] = {
+                "name": info["name"],
+                "ticker": info["ticker"],
+                "price": None,
+                "change": 0,
+                "change_pct": 0,
+            }
+    return jsonify(results)
+
+
+# ── Sentiment Analysis endpoint ──────────────────────────────────────────────
+
+@app.route("/api/sentiment")
+def api_sentiment():
+    """Analyze sentiment from recent news (last 48 hrs) for each tracked asset."""
+    results = {}
+    search_terms = {
+        "NASDAQ": "NASDAQ stock market",
+        "ETH": "Ethereum crypto",
+        "GBPJPY": "GBP JPY forex",
+    }
+
+    for key, query in search_terms.items():
+        articles = []
+        try:
+            with DDGS() as ddgs:
+                for item in ddgs.news(query, max_results=15):
+                    articles.append({
+                        "title": item.get("title", ""),
+                        "body": item.get("body", ""),
+                        "date": item.get("date", ""),
+                    })
+        except Exception as e:
+            print(f"Sentiment search error for {key}: {e}")
+
+        if not articles:
+            results[key] = {
+                "sentiment": "neutral",
+                "score": 0,
+                "article_count": 0,
+                "summary": "No recent news found",
+            }
+            continue
+
+        # Analyze sentiment of all collected headlines + bodies
+        scores = []
+        for art in articles:
+            text = f"{art['title']}. {art['body']}"
+            vs = sentiment_analyzer.polarity_scores(text)
+            scores.append(vs["compound"])
+
+        avg_score = sum(scores) / len(scores) if scores else 0
+
+        if avg_score >= 0.15:
+            sentiment = "bullish"
+        elif avg_score <= -0.15:
+            sentiment = "bearish"
+        else:
+            sentiment = "neutral"
+
+        # Pick top headline as summary
+        summary = articles[0]["title"] if articles else ""
+
+        results[key] = {
+            "sentiment": sentiment,
+            "score": round(avg_score, 3),
+            "article_count": len(articles),
+            "summary": summary,
+        }
+
+    return jsonify(results)
 
 
 # ── Dashboard HTML ────────────────────────────────────────────────────────────
@@ -678,7 +795,159 @@ DASHBOARD_HTML = r"""
     border-color: var(--accent);
   }
 
+  /* ── Market Ticker Section ── */
+  .market-section {
+    max-width: 1400px;
+    margin: 20px auto 0;
+    padding: 0 24px;
+  }
+
+  .market-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+  }
+
+  .market-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 20px;
+    transition: transform 0.2s, border-color 0.2s;
+  }
+
+  .market-card:hover {
+    transform: translateY(-2px);
+    border-color: var(--accent);
+  }
+
+  .market-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+
+  .market-card-name {
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text2);
+  }
+
+  .market-card-badge {
+    font-size: 10px;
+    padding: 3px 8px;
+    border-radius: 6px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .market-card-badge.bullish {
+    background: rgba(81, 207, 102, 0.15);
+    color: var(--green);
+  }
+
+  .market-card-badge.bearish {
+    background: rgba(255, 107, 107, 0.15);
+    color: var(--red);
+  }
+
+  .market-card-badge.neutral {
+    background: rgba(255, 169, 77, 0.15);
+    color: var(--orange);
+  }
+
+  .market-card-price {
+    font-size: 28px;
+    font-weight: 700;
+    margin-bottom: 6px;
+  }
+
+  .market-card-change {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 16px;
+  }
+
+  .market-card-change.up { color: var(--green); }
+  .market-card-change.down { color: var(--red); }
+  .market-card-change.flat { color: var(--text2); }
+
+  .sentiment-bar-wrap {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+
+  .sentiment-label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text2);
+    margin-bottom: 8px;
+  }
+
+  .sentiment-score {
+    font-weight: 600;
+  }
+
+  .sentiment-score.bullish { color: var(--green); }
+  .sentiment-score.bearish { color: var(--red); }
+  .sentiment-score.neutral { color: var(--orange); }
+
+  .sentiment-bar {
+    width: 100%;
+    height: 6px;
+    background: var(--surface2);
+    border-radius: 3px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .sentiment-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.6s ease;
+  }
+
+  .sentiment-bar-fill.bullish { background: linear-gradient(90deg, var(--green), #7aed8d); }
+  .sentiment-bar-fill.bearish { background: linear-gradient(90deg, var(--red), #ff9999); }
+  .sentiment-bar-fill.neutral { background: linear-gradient(90deg, var(--orange), #ffc578); }
+
+  .sentiment-summary {
+    font-size: 11px;
+    color: var(--text2);
+    margin-top: 8px;
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .market-loading {
+    text-align: center;
+    padding: 40px;
+    color: var(--text2);
+    font-size: 14px;
+  }
+
+  .market-loading .spinner {
+    margin: 0 auto 12px;
+  }
+
   /* ── Responsive ── */
+  @media (max-width: 900px) {
+    .market-grid { grid-template-columns: 1fr; }
+  }
+
   @media (max-width: 600px) {
     .grid { grid-template-columns: 1fr; }
     .search-row { flex-direction: column; }
@@ -709,6 +978,9 @@ DASHBOARD_HTML = r"""
       <button class="btn" type="submit" id="search-btn">Search</button>
     </form>
     <div class="quick-tags">
+      <span class="tag" onclick="quickSearch('NASDAQ')">NASDAQ</span>
+      <span class="tag" onclick="quickSearch('Ethereum')">Ethereum</span>
+      <span class="tag" onclick="quickSearch('GBP JPY Forex')">GBP/JPY</span>
       <span class="tag" onclick="quickSearch('Crude Oil')">Crude Oil</span>
       <span class="tag" onclick="quickSearch('Gold Price')">Gold Price</span>
       <span class="tag" onclick="quickSearch('Bitcoin')">Bitcoin</span>
@@ -716,8 +988,15 @@ DASHBOARD_HTML = r"""
       <span class="tag" onclick="quickSearch('S&P 500')">S&P 500</span>
       <span class="tag" onclick="quickSearch('Forex EUR USD')">EUR/USD</span>
       <span class="tag" onclick="quickSearch('Natural Gas')">Natural Gas</span>
-      <span class="tag" onclick="quickSearch('Silver Price')">Silver</span>
     </div>
+  </div>
+</div>
+
+<!-- ── Market Ticker + Sentiment Section ── -->
+<div class="market-section" id="market-section">
+  <div class="market-loading">
+    <div class="spinner"></div>
+    Loading market data &amp; sentiment...
   </div>
 </div>
 
@@ -1039,9 +1318,88 @@ document.addEventListener('keydown', function(e) {
   if (e.key === 'Escape') closeSettings();
 });
 
+// ── Market Data + Sentiment ──
+function loadMarketData() {
+  const section = document.getElementById('market-section');
+
+  // Fetch market prices and sentiment in parallel
+  Promise.all([
+    fetch('/api/market').then(r => r.json()),
+    fetch('/api/sentiment').then(r => r.json())
+  ])
+  .then(([market, sentiment]) => {
+    renderMarketSection(market, sentiment);
+  })
+  .catch(err => {
+    section.innerHTML = '<div class="market-loading" style="color:var(--red)">Failed to load market data: ' + escHtml(err.message) + '</div>';
+  });
+}
+
+function renderMarketSection(market, sentiment) {
+  const section = document.getElementById('market-section');
+  const keys = ['NASDAQ', 'ETH', 'GBPJPY'];
+  const icons = { NASDAQ: '\u{1F4C8}', ETH: '\u{26D3}', GBPJPY: '\u{1F4B1}' };
+
+  let html = '<div class="market-grid">';
+
+  keys.forEach(key => {
+    const m = market[key] || {};
+    const s = sentiment[key] || {};
+
+    const price = m.price != null ? formatPrice(m.price, key) : '--';
+    const change = m.change || 0;
+    const changePct = m.change_pct || 0;
+    const changeDir = change > 0 ? 'up' : change < 0 ? 'down' : 'flat';
+    const changeSign = change > 0 ? '+' : '';
+    const arrow = change > 0 ? '\u25B2' : change < 0 ? '\u25BC' : '\u25C6';
+
+    const sentimentType = s.sentiment || 'neutral';
+    const sentimentScore = s.score || 0;
+    // Convert score from [-1,1] to percentage [0,100]
+    const barPct = Math.round(((sentimentScore + 1) / 2) * 100);
+    const sentimentLabel = sentimentType.charAt(0).toUpperCase() + sentimentType.slice(1);
+    const articleCount = s.article_count || 0;
+    const summary = s.summary || '';
+
+    html +=
+      '<div class="market-card">' +
+        '<div class="market-card-header">' +
+          '<span class="market-card-name">' + icons[key] + ' ' + escHtml(m.name || key) + '</span>' +
+          '<span class="market-card-badge ' + sentimentType + '">' + sentimentLabel + '</span>' +
+        '</div>' +
+        '<div class="market-card-price">' + price + '</div>' +
+        '<div class="market-card-change ' + changeDir + '">' +
+          '<span>' + arrow + '</span>' +
+          '<span>' + changeSign + change.toFixed(2) + ' (' + changeSign + changePct.toFixed(2) + '%)</span>' +
+        '</div>' +
+        '<div class="sentiment-bar-wrap">' +
+          '<div class="sentiment-label">' +
+            '<span>Sentiment (' + articleCount + ' articles)</span>' +
+            '<span class="sentiment-score ' + sentimentType + '">' + (sentimentScore >= 0 ? '+' : '') + sentimentScore.toFixed(3) + '</span>' +
+          '</div>' +
+          '<div class="sentiment-bar"><div class="sentiment-bar-fill ' + sentimentType + '" style="width:' + barPct + '%"></div></div>' +
+          (summary ? '<div class="sentiment-summary">' + escHtml(summary) + '</div>' : '') +
+        '</div>' +
+      '</div>';
+  });
+
+  html += '</div>';
+  section.innerHTML = html;
+}
+
+function formatPrice(price, key) {
+  if (key === 'NASDAQ') return price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (key === 'ETH') return '$' + price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (key === 'GBPJPY') return '\u00A5' + price.toFixed(3);
+  return price.toFixed(2);
+}
+
 // ── Initialize on load ──
 window.addEventListener('DOMContentLoaded', function() {
   populateSourceDropdown();
+
+  // Load market data + sentiment
+  loadMarketData();
 
   // Auto-search "Business News" on startup
   document.getElementById('keyword-input').value = 'Business News';
