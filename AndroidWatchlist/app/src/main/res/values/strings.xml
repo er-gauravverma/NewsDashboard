@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Trading Watchlist</string>
+    <string name="title_alerts">Price Alerts</string>
+    <string name="action_alerts">Alerts</string>
+    <string name="action_refresh">Refresh</string>
+    <string name="no_alerts">No alerts configured.\nTap + to add one.</string>
+    <string name="swipe_to_delete">Swipe to delete</string>
+</resources>
